@@ -1,0 +1,11 @@
+post reset tensordict _StringKeys(
+    dict_keys(['observation', 'done', 'terminated', 'truncated', 'step_count']))
+
+post policy tensordict _StringKeys(
+    dict_keys(['observation', 'done', 'terminated', 'truncated', 'step_count', 'loc', 'scale', 'action', 'action_log_prob']))
+
+post step tensordict _StringKeys(
+    dict_keys(['observation', 'done', 'terminated', 'truncated', 'step_count', 'loc', 'scale', 'action', 'action_log_prob', 'next']))
+
+'next' keys:
+    dict_keys(['observation', 'reward', 'truncated', 'done', 'terminated', 'step_count']))
