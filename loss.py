@@ -15,7 +15,10 @@ def quantile_loss(q_low, q_high, actions, alpha):
     are not *required* to be normalized to [0,1] in the action space
     """
     # assert q_low.shape == q_high.shape == actions.shape
-    assert q_low < q_high
+    # print(f'q_low {q_low.shape} q_high {q_high.shape}')
+    # q_low = q_low.squeeze()
+    # q_high = q_high.squeeze()
+    # assert torch.le(q_low, q_high)
 
     low_loss = torch.where(
         actions >= q_low,
@@ -36,7 +39,7 @@ def quantile_loss(q_low, q_high, actions, alpha):
 class ActorWithQuantiles(nn.Module):
     """Separates policy outputs from quantile outputs"""
     def __init__(self, actor_net, action_dim, action_low, action_high, device):
-        super().__init__(ActorWithQuantiles)
+        super().__init__()
         self.actor_net = actor_net  # Everything up to but NOT including extractor
         self.normal_extractor = NormalParamExtractor()
         self.action_dim = action_dim

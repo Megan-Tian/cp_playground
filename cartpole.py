@@ -27,7 +27,11 @@ from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from tqdm import tqdm
 
-from utils import ActorWithQuantiles, quantile_loss
+from loss import ActorWithQuantiles, quantile_loss
+
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter()
+
 
 # setup
 is_fork = multiprocessing.get_start_method() == "fork"
@@ -52,7 +56,7 @@ total_frames = 500_000 # 100k takes 3-4min to on laptop 4070 gpu
 sub_batch_size = 64  # cardinality of the sub-samples gathered from the current data in the inner loop
 num_epochs = 10  # optimization steps per batch of data collected
 clip_epsilon = (
-    0.2  # clip value for PPO loss: see the equation in the intro for more context.
+    0.2  # clip value for PPO loss
 )
 gamma = 0.99
 lmbda = 0.95
@@ -204,9 +208,15 @@ eval_str = ""
 
 for i, tensordict_data in enumerate(tqdm(collector)):
     # now work with a specific batch of data
-    for _ in range(num_epochs):
+    for epoch in range(num_epochs):
         # PPO advantage signal, depends on value network which is updated in the inner loop
+        # print(f'tensordict keys: {tensordict_data.keys()}')
+        # print(f'observation before: {tensordict_data["observation"].shape}')
         advantage_module(tensordict_data)
+        # print(f'action: {tensordict_data["action"].shape}')
+        # print(f'observation after: {tensordict_data["observation"].shape}')
+        # print(f'tensordict keys: {tensordict_data.keys()}')
+        # raise Exception('STOP!')
         data_view = tensordict_data.reshape(-1)
         replay_buffer.extend(data_view.cpu())
 
@@ -222,8 +232,10 @@ for i, tensordict_data in enumerate(tqdm(collector)):
 
             # quantile loss
             q_low_loss, q_high_loss = quantile_loss(
-                q_low=alpha, 
-                q_high=(1-alpha), 
+                # TODO big oops ##########################
+                q_low=tensordict_data['q_low'].squeeze(), 
+                q_high=tensordict_data['q_high'].squeeze(), 
+                #################################
                 actions=tensordict_data["action"], 
                 alpha=alpha
             )
@@ -240,6 +252,17 @@ for i, tensordict_data in enumerate(tqdm(collector)):
             # combine losses
             loss_lambda = 1 # TODO properly tune this hyperparam
             loss_value = loss_value + loss_lambda * (q_low_loss.mean() + q_high_loss.mean())
+
+            # logging
+            writer.add_scalar("Loss/train_loss_objective", loss_vals["loss_objective"], epoch + i*num_epochs)
+            writer.add_scalar("Loss/train_loss_critic", loss_vals["loss_critic"], epoch + i*num_epochs)
+            writer.add_scalar("Loss/train_loss_entropy", loss_vals["loss_entropy"], epoch + i*num_epochs)
+            writer.add_scalar("Loss/train_total", loss_value, epoch + i*num_epochs)
+            writer.add_scalar("Loss/train_q_low_loss", q_low_loss.mean().item(), epoch + i*num_epochs)
+            writer.add_scalar("Loss/train_q_high_loss", q_high_loss.mean().item(), epoch + i*num_epochs)
+
+            coverage = torch.mean(((tensordict_data["action"] >= tensordict_data['q_low'].squeeze()) & (tensordict_data["action"] <= tensordict_data['q_high'].squeeze())).type(torch.float32)).float()
+            writer.add_scalar("Loss/action_coverage_pct", coverage, epoch + i*num_epochs)
 
             # Backward pass: grad clipping and optimization step
             loss_value.backward()
@@ -334,4 +357,6 @@ torch.save(logs, 'cartpole-train-val-logs.pkl')
 # plt.title("Coverage")
 # plt.savefig('cartpole-coverage.png')
 
+writer.flush()
+writer.close()
 env.close()
