@@ -49,7 +49,7 @@ max_grad_norm = 1.0
 
 frames_per_batch = 1000
 # For a complete training, bring the number of frames up to 1M
-total_frames = 200_000
+total_frames = 100_000
 
 sub_batch_size = 64  # cardinality of the sub-samples gathered from the current data in the inner loop
 num_epochs = 10  # optimization steps per batch of data collected
@@ -106,17 +106,37 @@ class QuantileActorHead(nn.Module):
         # Network outputs a single tensor with 4*action_dim features
         raw_output = self.network(observation)
         
-        # split output into four equal parts along the last dimension
-        # We now interpret the last chunk as the *raw offset* for q_high
-        loc, log_scale, q_low, q_high_delta_raw = raw_output.chunk(4, dim=-1)
+        # TOGGLE THIS TO PRED Q_LOW + DELTA_HIGH vs DELTA_LOW + DELTA_HIGH
+        use_offset_from_action = True
         
-        # Process scale: std must be positive. ProbabilisticActor returns log probs
-        scale = torch.exp(log_scale)
-        
-        # process the high quantile to be strictly greater than the low quantile
-        q_high_delta = F.softplus(q_high_delta_raw) + 1e-6
-        q_high = q_low + q_high_delta
-        
+        if use_offset_from_action:
+            loc, log_scale, q_low_delta_raw, q_high_delta_raw = raw_output.chunk(4, dim=-1)
+            # scale = torch.exp(log_scale)
+            scale = tensordict.nn.mappings("biased_softplus_1.0")(log_scale)
+            q_low = loc - (F.softplus(q_low_delta_raw))
+            q_high = loc + (F.softplus(q_high_delta_raw))
+            # q_low = loc + q_low_delta_raw
+            # q_high = loc + q_high_delta_raw
+            
+        else:
+            # split output into four equal parts along the last dimension
+            # We now interpret the last chunk as the *raw offset* for q_high
+            # loc, log_scale, q_low, q_high_delta_raw = raw_output.chunk(4, dim=-1)
+            
+            # Process scale: std must be positive. ProbabilisticActor returns log probs
+            # scale = torch.exp(log_scale)
+            # scale = tensordict.nn.mappings("biased_softplus_1.0")(log_scale)
+            
+            # process the high quantile to be strictly greater than the low quantile
+            # q_high_delta = F.softplus(q_high_delta_raw) + 1e-6
+            # q_high = q_low + q_high_delta
+            
+            
+            # pred low and high directly
+            loc, log_scale, q_low, q_high = raw_output.chunk(4, dim=-1)
+            scale = tensordict.nn.mappings("biased_softplus_1.0")(log_scale)
+            
+            
         return loc, scale, q_low, q_high
 
 
@@ -283,7 +303,6 @@ def train():
                     coverage = action_in_range.float().mean()
                     writer.add_scalar("metrics/action_coverage_pct", coverage.item(), epoch + i*num_epochs)
 
-
                 # Optimization: backward, grad clipping and optimization step
                 loss_value.backward()
                 torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
@@ -338,9 +357,10 @@ def train():
     writer.close()
 
 
-def eval():
+def eval(num_episodes = 10, conformalized=False, q_hat=None):
     ################## LOAD POLICY ##################
     policy_path = f"baseline/{env_name}-policy-{total_frames}.pth"
+    # policy_path = f"inverted_pendulum_100k_ckpt/InvertedPendulum-v5-policy-100000.pth"
     print(f'Loading policy from {policy_path}')
     policy_module = torch.load(policy_path, map_location=torch.device("cpu"), weights_only=False)
     policy_module.eval()
@@ -364,121 +384,167 @@ def eval():
     print("Running policy:", policy_module(env.reset()))
     check_env_specs(env)
     
-    ################## ROLLOUT (manual stepping) ##################
-    max_ep_steps = 100
-    rollout = tensordict.TensorDict(batch_size=[max_ep_steps])
+    all_actions = []
+    all_scales = []
+    all_q_lows = []
+    all_q_highs = []
     
-    _data = env.reset()
-    i = 0
-    done = False
 
-    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        while i < max_ep_steps and not done:
-            # policy_module returns a tensordict with 'action', 'loc', 'scale', 'q_low', 'q_high'
-            action_td = policy_module(_data.to_tensordict())
-            
-            # only need to assign the 'action' key for the env step
-            _data["action"] = action_td.get("action")
-            
-            _data = env.step(_data) # advance env
-            
-            # Store ALL data from the step (including 'q_low' and 'q_high' from action_td)
-            # We merge the action_td into the _data tensordict before saving
-            rollout[i] = _data.clone().update(action_td)
-            
-            _data = torchrl.envs.utils.step_mdp(_data, keep_other=True) # advance data tensordict
+    for _ in range(num_episodes):
+        ################## ROLLOUT (manual stepping) ##################
+        max_ep_steps = 50
+        rollout = tensordict.TensorDict(batch_size=[max_ep_steps])
+        
+        _data = env.reset()
+        i = 0
+        done = False
 
-            done = _data["terminated"].item() or _data["truncated"].item() or _data["done"].item()
-            i += 1
-            
-    print(f'Rollout finished at step {i}')
-    rollout = rollout[:i] # Trim the rollout to the actual length
+        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+            while i < max_ep_steps and not done:
+                # policy_module returns a tensordict with 'action', 'loc', 'scale', 'q_low', 'q_high'
+                action_td = policy_module(_data.to_tensordict())
+                
+                # only need to assign the 'action' key for the env step
+                _data["action"] = action_td.get("action")
+                
+                _data = env.step(_data) # advance env
+                
+                # Store ALL data from the step (including 'q_low' and 'q_high' from action_td)
+                # We merge the action_td into the _data tensordict before saving
+                rollout[i] = _data.clone().update(action_td)
+                
+                _data = torchrl.envs.utils.step_mdp(_data, keep_other=True) # advance data tensordict
 
-    utils.video_writer(rollout["pixels"], f"{env_name}_videos/{env_name}-{datetime.now()}.mp4")
+                done = _data["terminated"].item() or _data["truncated"].item() or _data["done"].item()
+                i += 1
+                
+        print(f'Rollout finished at step {i}')
+        rollout = rollout[:i] # Trim the rollout to the actual length
 
-    ################## PLOT RESULTS ##################
-    rewards = rollout["next", "reward"]
-    actions = rollout["action"]
-    observations = rollout["observation"]
-    
-    ### MODIFIED ###
-    # Extract the new quantile keys
-    q_low = rollout["q_low"]
-    q_high = rollout["q_high"]
-    
-    print(f"rewards.shape: {rewards.shape} | actions.shape: {actions.shape} | observations.shape: {observations.shape}")
-    print(f"q_low.shape: {q_low.shape} | q_high.shape: {q_high.shape}")
-    
-    total_reward = rewards.sum().item()
-    step_count = rollout["step_count"].max().item()
+        utils.video_writer(rollout["pixels"], f"{env_name}_videos/{env_name}-{datetime.now()}.mp4")
 
-    print(f"Eval complete")
-    print(f"Total reward: {total_reward:.2f}")
-    print(f"Steps survived: {step_count}")
-    print(f"rollout keys: {rollout.keys()}")
-    # print(f"rollout['pixels'].shape: {rollout['pixels'].shape}")
+        ################## PLOT RESULTS ##################
+        rewards = rollout["next", "reward"]
+        actions = rollout["action"]
+        observations = rollout["observation"]
+        
+        ### MODIFIED ###
+        # Extract the new quantile keys
+        q_low = rollout["q_low"]
+        q_high = rollout["q_high"]
+        scale = rollout["scale"]
+        
+        print(f"rewards.shape: {rewards.shape} | actions.shape: {actions.shape} | observations.shape: {observations.shape}")
+        print(f"q_low.shape: {q_low.shape} | q_high.shape: {q_high.shape}")
+        
+        total_reward = rewards.sum().item()
+        step_count = rollout["step_count"].max().item()
 
-    # reward
-    plt.figure(figsize=(12, 8))
-    plt.subplot(2, 1, 1) # Top plot
-    plt.plot(rewards.squeeze().cpu().numpy(), label="reward")
-    plt.title(f"Reward per Step (Total: {total_reward:.2f})")
-    plt.xlabel("Step")
-    plt.ylabel("Reward")
-    plt.grid()
-    plt.legend()
+        print(f"Eval complete")
+        print(f"Total reward: {total_reward:.2f}")
+        print(f"Steps survived: {step_count}")
+        print(f"rollout keys: {rollout.keys()}")
+        # print(f"rollout['pixels'].shape: {rollout['pixels'].shape}")
 
-    # actions / obs / quantiles
-    plt.subplot(2, 1, 2) # Bottom plot
-    
-    # actions
-    action_np = actions.detach().cpu().numpy().squeeze()
-    steps = range(len(action_np))
-    plt.plot(steps, action_np, label="action (deterministic)", marker="o", markersize=2, linestyle='None')
+        # reward
+        plt.figure(figsize=(12, 8))
+        plt.subplot(3, 1, 1) # Top plot
+        plt.plot(rewards.squeeze().cpu().numpy(), label="reward")
+        plt.title(f"Reward per Step (Total: {total_reward:.2f})")
+        plt.xlabel("Step")
+        plt.ylabel("Reward")
+        plt.grid()
+        plt.legend()
 
-    # quantile predictions
-    q_low_np = q_low.detach().cpu().numpy().squeeze()
-    q_high_np = q_high.detach().cpu().numpy().squeeze()
+        # actions / obs / quantiles
+        plt.subplot(3, 1, 2) # middle plot
+        
+        # actions
+        action_np = actions.detach().cpu().numpy().squeeze()
+        steps = range(len(action_np))
+        plt.plot(steps, action_np, label="action (deterministic)", marker="o", markersize=2, linestyle='None')
 
-    plt.plot(steps, q_low_np, label=f"q_low ({low_quantile*100:.0f}th percentile)", color='orange', linestyle='--')
-    plt.plot(steps, q_high_np, label=f"q_high ({high_quantile*100:.0f}th percentile)", color='green', linestyle='--')
-    
-    # fill in area between quantiles
-    plt.fill_between(
-        steps,
-        q_low_np,
-        q_high_np,
-        color='gray', alpha=0.2, label="Predicted Quantile Band"
-    )
-    
-    # Plot observations
-    obs_np = observations.cpu().numpy()
-    # for j in range(obs_np.shape[1]):
-    #     plt.plot(steps, obs_np[:, j], label=f"observation[{j}]", alpha=0.5)
+        # quantile predictions
+        q_low_np = q_low.detach().cpu().numpy().squeeze()
+        q_high_np = q_high.detach().cpu().numpy().squeeze()
+        
+        if conformalized and q_hat is not None:
+            # conform_pred is a function (q_low, q_high, q_hat) --> (conformal q_low, conformal q_high)
+            q_low_np = q_low_np - q_hat
+            q_high_np = q_high_np + q_hat
+        
+        coverage = ((actions >= q_low) & (actions <= q_high)).float().mean().item()
+        print(f"Action quantile coverage: {coverage * 100:.2f}%")
+        plt.plot(steps, q_low_np, label=f"q_low ({low_quantile*100:.0f}th percentile)", color='orange', linestyle='--')
+        plt.plot(steps, q_high_np, label=f"q_high ({high_quantile*100:.0f}th percentile)", color='green', linestyle='--')
+        
+        # fill in area between quantiles
+        plt.fill_between(
+            steps,
+            q_low_np,
+            q_high_np,
+            color='gray', alpha=0.2, label="Predicted Quantile Band"
+        )
+        
+        scale_np = scale
+        print(f'scale shape = {scale_np.shape}')
+        plt.plot(steps, actions - scale_np, label="std of action", color='grey')
+        plt.plot(steps, actions + scale_np, label="std of action", color='grey')
+        # plt.fill_between(
+        #     steps,
+        #     actions - scale,
+        #     actions + scale,
+        #     color='blue', alpha=0.2, label="Action Band"
+        # )
+        
+        # Plot observations
+        obs_np = observations.cpu().numpy()
+        # for j in range(obs_np.shape[1]):
+        #     plt.plot(steps, obs_np[:, j], label=f"observation[{j}]", alpha=0.5)
 
-    plt.title("Actions and Observations")
-    plt.xlabel("Step")
-    plt.ylabel("Value")
-    plt.grid()
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5)) # Legend outside
-    plt.tight_layout()
-    plt.show()
+        plt.title("Actions and Observations")
+        plt.xlabel("Step")
+        plt.ylabel("Value")
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5)) # Legend outside
+
+        
+        # plot the difference between quantiles
+        plt.subplot(3, 1, 3) # bottom plot
+        plt.plot(steps, q_high_np - q_low_np, label="Q_high - Q_low")
+        plt.plot(steps, action_np - q_low_np, label="Action - Q_low")
+        plt.plot(steps, q_high_np - action_np, label="Q_high - Action")
+        plt.plot(steps, scale_np, label="scale")
+        plt.title("Quantile Differences")
+        plt.xlabel("Step")
+        plt.ylabel("Value")
+        
+        plt.grid()
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5)) # Legend outside
+        plt.tight_layout()
+        plt.show()
+        
+        all_actions.append(action_np)
+        all_q_lows.append(q_low_np)
+        all_q_highs.append(q_high_np)
+        all_scales.append(scale)
 
     env.close()
 
-
+    return all_actions, all_q_lows, all_q_highs, all_scales
     # CQ
     # https://mlwithouttears.com/2024/01/17/conformalized-quantile-regression/ bullet 3)
-    scores = max(actions - q_high, q_low - actions)
-    alpha = 0.1
-    q_cqr = np.quantile(scores, 1-alpha)
-    coverage_interval_low = q_low - q_cqr
-    coverage_interval_high = q_high + q_cqr
-    coverage = ((actions >= coverage_interval_low) & (actions <= coverage_interval_high)).float().mean().item()
-    print(f"Action quantile coverage: {coverage * 100:.2f}%")
+    # scores = max(actions - q_high, q_low - actions)
+    # alpha = 0.1
+    # q_cqr = np.quantile(scores, 1-alpha)
+    # coverage_interval_low = q_low - q_cqr
+    # coverage_interval_high = q_high + q_cqr
+    # coverage = ((actions >= coverage_interval_low) & (actions <= coverage_interval_high)).float().mean().item()
+    # print(f"Action quantile coverage: {coverage * 100:.2f}%")
 
 
 if __name__ == "__main__":
     # train()
     eval()
+    # eval()
+    # eval()
 
