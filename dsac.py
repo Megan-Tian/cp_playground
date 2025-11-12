@@ -1,0 +1,609 @@
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+from collections import deque
+from torch.distributions import Normal
+from typing import Tuple, Optional, Dict
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int = 100000):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size: int):
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        states, actions, rewards, next_states, dones = zip(*[self.buffer[i] for i in indices])
+        
+        return (
+            torch.FloatTensor(np.array(states)),
+            torch.FloatTensor(np.array(actions)),
+            torch.FloatTensor(np.array(rewards)).unsqueeze(1),
+            torch.FloatTensor(np.array(next_states)),
+            torch.FloatTensor(np.array(dones)).unsqueeze(1)
+        )
+    
+    def __len__(self):
+        return len(self.buffer)
+
+
+class QuantileNetwork(nn.Module):
+    """Quantile value network Z(s, a, tau)"""
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, 
+                 num_quantiles: int = 32):
+        super().__init__()
+        self.num_quantiles = num_quantiles
+        
+        # input is concatenated [state, action, tau]
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim + 1, hidden_dim), # +1 is for tau (scalar)
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1)
+        )
+    
+    def forward(self, state, action, tau):
+        """
+        Args:
+            state: (batch_size, state_dim)
+            action: (batch_size, action_dim)
+            tau: (batch_size, num_quantiles)
+        Returns:
+            quantile_values: (batch_size, num_quantiles)
+        """
+        batch_size = state.shape[0]
+        num_quantiles = tau.shape[1]
+        
+        # expand state and action to match quantiles
+        state_expanded = state.unsqueeze(1).expand(-1, num_quantiles, -1)  # (B, T, state_dim)
+        action_expanded = action.unsqueeze(1).expand(-1, num_quantiles, -1)  # (B, T, action_dim)
+        tau_expanded = tau.unsqueeze(-1)  # (B, T, 1)
+        
+        # concatenate all inputs to match input shape to self.net
+        inputs = torch.cat([state_expanded, action_expanded, tau_expanded], dim=-1)  # (B, T, state_dim + action_dim + 1)
+        inputs_flat = inputs.reshape(-1, inputs.shape[-1])  # (B*T, state_dim + action_dim + 1)
+        
+        # send through network
+        outputs_flat = self.net(inputs_flat)  # (B*T, 1)
+        
+        # reshape back
+        quantile_values = outputs_flat.reshape(batch_size, num_quantiles)  # (B, T)
+        
+        return quantile_values
+
+
+class GaussianPolicy(nn.Module):
+    """Stochastic Gaussian policy with Tanh action squashing"""
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256,
+                 log_std_min: float = -20, log_std_max: float = 2):
+        super().__init__()
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+        
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # mean and std of actions are implementated as separate output heads/layers on top of self.net
+        self.mean_layer = nn.Linear(hidden_dim, action_dim)
+        self.log_std_layer = nn.Linear(hidden_dim, action_dim)
+    
+    def forward(self, state, deterministic: bool = False, return_log_prob: bool = True):
+        """
+        Args:
+            state: (batch_size, state_dim)
+        Returns:
+            action, log_prob (optional)
+        """
+        features = self.net(state)
+        
+        # mean and std are two separate heads sharing backbone self.net
+        mean = self.mean_layer(features)
+        log_std = self.log_std_layer(features)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        std = log_std.exp()
+        
+        if deterministic:
+            action = torch.tanh(mean)
+            log_prob = None
+        else:
+            dist = Normal(mean, std)
+            # reparameterization trick
+            x = dist.rsample()
+            action = torch.tanh(x)
+            
+            if return_log_prob:
+                # compute log probability with tanh correction
+                # see appendix C of SAC paper
+                # also: https://dosssman.github.io/posts/2022-04-13-sac/#policy-network-1
+                log_prob = dist.log_prob(x)
+                log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+                log_prob = log_prob.sum(dim=-1, keepdim=True)
+            else:
+                log_prob = None
+        
+        return action, log_prob, mean, log_std
+
+
+def quantile_huber_loss(quantile_pred, target, tau, kappa: float = 1.0):
+    """
+    Quantile Huber loss
+    
+    Args:
+        quantile_pred: (batch_size, num_quantiles)
+        target: (batch_size, num_quantiles)
+        tau: (batch_size, num_quantiles)
+        kappa: Huber loss threshold
+    """
+    # expand dims for pairwise TD errors
+    quantile_pred = quantile_pred.unsqueeze(-1)  # (B, T, 1)
+    target = target.unsqueeze(1)  # (B, 1, T)
+    tau = tau.unsqueeze(-1)  # (B, T, 1)
+    
+    # pairwise td errors
+    td_errors = target - quantile_pred  # (B, T, T)
+    
+    # huber loss
+    huber_loss = torch.where(
+        td_errors.abs() <= kappa,
+        0.5 * td_errors.pow(2),
+        kappa * (td_errors.abs() - 0.5 * kappa)
+    )
+    
+    # qr loss, (tau - td_errors < 0) does the weighting / decides what threshold to use
+    quantile_weight = torch.abs(tau - (td_errors < 0).float())
+    loss = (quantile_weight * huber_loss).mean()
+    
+    return loss
+
+
+class DSAC:
+    """Distributional Soft Actor-Critic"""
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        num_quantiles: int = 32,
+        discount: float = 0.99,
+        alpha: float = 0.2,
+        tau: float = 0.005,
+        policy_lr: float = 3e-4,
+        q_lr: float = 3e-4,
+        device: str = 'cpu'
+    ):
+        # params
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.num_quantiles = num_quantiles
+        self.discount = discount
+        self.alpha = alpha
+        self.tau = tau
+        self.device = device
+        
+        # policy and (double) critic networks
+        self.policy = GaussianPolicy(state_dim, action_dim, hidden_dim).to(device)
+        self.zf1 = QuantileNetwork(state_dim, action_dim, hidden_dim, num_quantiles).to(device)
+        self.zf2 = QuantileNetwork(state_dim, action_dim, hidden_dim, num_quantiles).to(device)
+        
+        # target networks (recall these track the current self.zf1, self.zf2 with small delay to stabilize updates)
+        self.target_zf1 = QuantileNetwork(state_dim, action_dim, hidden_dim, num_quantiles).to(device)
+        self.target_zf2 = QuantileNetwork(state_dim, action_dim, hidden_dim, num_quantiles).to(device)
+        self.target_zf1.load_state_dict(self.zf1.state_dict())
+        self.target_zf2.load_state_dict(self.zf2.state_dict())
+        
+        # optimizers
+        self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=policy_lr)
+        self.zf1_optimizer = optim.Adam(self.zf1.parameters(), lr=q_lr)
+        self.zf2_optimizer = optim.Adam(self.zf2.parameters(), lr=q_lr)
+    
+    def get_tau(self, batch_size: int, mode: str = 'iqn'):
+        """
+        Generate quantile fractions for distributional RL.
+        
+        Args:
+            batch_size: number of samples/taus
+            mode: 'fix' for evenly-spaced quantiles (0.1, 0.2, 0.3, ...)
+                  'iqn' for random quantiles
+        
+        Returns:
+            tau: (batch_size, num_quantiles) - cumulative probabilities [0, 1]
+                 Example: [0.05, 0.15, 0.28, 0.45, ..., 0.98]
+                 
+            tau_hat: (batch_size, num_quantiles) - midpoints between quantiles
+                     Used for computing quantile values Z(s, a, tau_hat)
+                     Example: [0.025, 0.10, 0.215, 0.365, ..., 0.99]
+                     
+            presum_tau: (batch_size, num_quantiles) - widths of each quantile bin
+                        Used as weights when computing E[Z] = Q
+                        Example: [0.05, 0.10, 0.13, 0.17, ..., 0.02]
+                        (these sum to 1.0 for each batch)
+        
+        """
+        if mode == 'fix': # fix uniform quantiles: [1/N, 2/N, 3/N, ..., N/N]
+            presum_tau = torch.ones(batch_size, self.num_quantiles, device=self.device) / self.num_quantiles
+        elif mode == 'iqn': # randomly sample quantiles
+            # random widths that sum to 1
+            presum_tau = torch.rand(batch_size, self.num_quantiles, device=self.device) + 0.01 # add a small epsilon > 0 to avoid "quantile 0" 
+            presum_tau = presum_tau / presum_tau.sum(dim=-1, keepdim=True)
+        else:
+            raise ValueError("Invalid mode for get_tau(). Choose 'fix' or 'iqn'")
+        
+        # tau values (cumulative probabilities)
+        tau = torch.cumsum(presum_tau, dim=1)
+        
+        # compute midpoints (tau_hat) - these are what we actually feed to the network (see DSAC paper section 3.2)
+        # midpoint of [tau[i-1], tau[i]] is (tau[i-1] + tau[i])/2
+        tau_hat = torch.zeros_like(tau)
+        tau_hat[:, 0] = tau[:, 0] / 2.0
+        tau_hat[:, 1:] = (tau[:, :-1] + tau[:, 1:]) / 2.0
+        
+        return tau, tau_hat, presum_tau
+    
+    def train_step(self, replay_buffer: ReplayBuffer, batch_size: int = 256) -> Dict:
+        if len(replay_buffer) < batch_size:
+            return {}
+        
+        # sample batch
+        states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device)
+        
+        # UPDATE Q NETS
+        with torch.no_grad():
+            # sample next actions from current policy
+            next_actions, next_log_probs, _, _ = self.policy(next_states)
+            
+            # get quantile fractions
+            next_tau, next_tau_hat, next_presum_tau = self.get_tau(batch_size)
+            
+            # compute target quantile values (remember to do both q nets)
+            target_z1 = self.target_zf1(next_states, next_actions, next_tau_hat)
+            target_z2 = self.target_zf2(next_states, next_actions, next_tau_hat)
+            target_z = torch.min(target_z1, target_z2)
+            
+            # entropy bonus (sac)
+            target_z = target_z - self.alpha * next_log_probs
+            
+            # distributional Bellman target
+            z_target = rewards + (1 - dones) * self.discount * target_z
+        
+        # current quantile values
+        tau, tau_hat, presum_tau = self.get_tau(batch_size)
+        z1_pred = self.zf1(states, actions, tau_hat)
+        z2_pred = self.zf2(states, actions, tau_hat)
+        
+        # quantile regression losses
+        zf1_loss = quantile_huber_loss(z1_pred, z_target, tau_hat)
+        zf2_loss = quantile_huber_loss(z2_pred, z_target, tau_hat)
+        
+        # update Q networks
+        self.zf1_optimizer.zero_grad()
+        zf1_loss.backward()
+        self.zf1_optimizer.step()
+        
+        self.zf2_optimizer.zero_grad()
+        zf2_loss.backward()
+        self.zf2_optimizer.step()
+        
+        # UPDATE POLICY
+        new_actions, log_probs, policy_mean, policy_log_std = self.policy(states)
+        
+        # get q vals from quantile networks
+        new_tau, new_tau_hat, new_presum_tau = self.get_tau(batch_size)
+        z1_new = self.zf1(states, new_actions, new_tau_hat)
+        z2_new = self.zf2(states, new_actions, new_tau_hat)
+        
+        # compute expected Q values (expectation over quantiles)
+        q1_new = (new_presum_tau * z1_new).sum(dim=1, keepdim=True)
+        q2_new = (new_presum_tau * z2_new).sum(dim=1, keepdim=True)
+        q_new = torch.min(q1_new, q2_new)
+        
+        # policy loss (maximize Q - alpha * entropy)
+        # entropy term: (alpha * log_probs) (higher log_prob = lower entropy)
+        # want to maximize Q and entropy, so minimize (alpha * log_probs - Q)
+        entropy_term = (self.alpha * log_probs).mean()
+        q_term = q_new.mean()
+        policy_loss = entropy_term - q_term
+        
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
+        
+        # UPDATE TARGET NETWORKS (SOFT UPDATE)
+        self.soft_update(self.zf1, self.target_zf1)
+        self.soft_update(self.zf2, self.target_zf2)
+        
+        return {
+            'loss/zf1_loss': zf1_loss.item(),
+            'loss/zf2_loss': zf2_loss.item(),
+            'loss/critic_loss': (zf1_loss.item() + zf2_loss.item()) / 2,
+            'loss/policy_loss': policy_loss.item(),
+            'loss/entropy_term': entropy_term.item(),
+            'loss/q_term': q_term.item(),
+            'loss/total_loss': zf1_loss.item() + zf2_loss.item() + policy_loss.item(),
+            'train/q_value_mean': q_new.mean().item(),
+            'train/q_value_std': q_new.std().item(),
+            'train/q1_value': q1_new.mean().item(),
+            'train/q2_value': q2_new.mean().item(),
+            'train/log_prob_mean': log_probs.mean().item(),
+            'train/log_prob_std': log_probs.std().item(),
+            'train/policy_mean': policy_mean.mean().item(),
+            'train/policy_std': policy_log_std.exp().mean().item(),
+            'train/z1_pred_mean': z1_pred.mean().item(),
+            'train/z2_pred_mean': z2_pred.mean().item(),
+            'train/z_target_mean': z_target.mean().item(),
+        }
+    
+    def soft_update(self, source, target):
+        """
+        Soft update target network
+        """
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+    
+    def select_action(self, state, deterministic: bool = False):
+        """
+        Select action from policy
+        """
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action, _, _, _ = self.policy(state, deterministic=deterministic)
+        return action.cpu().numpy()[0]
+
+
+def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10) -> Dict:
+    """
+    Evaluate the agent on `num_episodes` validation episodes
+    """
+    env = gym.make(env_name)
+    episode_rewards = []
+    episode_lengths = []
+    
+    for _ in range(num_episodes):
+        state, _ = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        done = False
+        
+        while not done:
+            action = agent.select_action(state, deterministic=True)
+            state, reward, terminated, truncated, _ = env.step(action)
+            episode_reward += reward
+            episode_length += 1
+            done = terminated or truncated
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+    
+    env.close()
+    
+    return {
+        'eval/episode_reward_mean': np.mean(episode_rewards),
+        'eval/episode_reward_max': np.max(episode_rewards),
+        'eval/episode_reward_min': np.min(episode_rewards),
+        'eval/episode_reward_std': np.std(episode_rewards),
+        'eval/episode_length_mean': np.mean(episode_lengths),
+        'eval/episode_length_max': np.max(episode_lengths),
+    }
+
+
+def train_dsac(
+    env_name: str = "InvertedPendulum-v4",
+    max_episodes: int = 300,
+    max_steps: int = 1000,
+    batch_size: int = 256,
+    eval_interval: int = 10,
+    eval_episodes: int = 5,
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    log_dir: str = None
+):
+    """Train DSAC on Gymnasium environment with TensorBoard logging"""
+    
+    # Create log directory
+    if log_dir is None:
+        timestamp = datetime.now().strftime("%m_%d_%Y_%H%M%S")
+        log_dir = f"runs/dsac_{env_name}/{timestamp}"
+    
+    writer = SummaryWriter(log_dir)
+    print(f"Logging to: {log_dir}")
+    
+    # create environment
+    env = gym.make(env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    
+    print(f"Environment: {env_name} | State dim: {state_dim}, Action dim: {action_dim} | Device: {device}")
+    
+    # agent
+    agent = DSAC(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        hidden_dim=256,
+        num_quantiles=32,
+        discount=0.99,
+        alpha=0.2,
+        device=device
+    )
+    
+    # replay buffer
+    replay_buffer = ReplayBuffer(capacity=100000)
+    
+    # training tracking
+    global_step = 0
+    episode_rewards = []
+    episode_lengths = []
+    current_episode_rewards = []
+    current_episode_lengths = []
+    
+    # TRAIN LOOP    
+    for episode in range(max_episodes):
+        state, _ = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        
+        for step in range(max_steps):
+            # select action
+            if len(replay_buffer) < 1000:
+                action = env.action_space.sample()
+            else:
+                action = agent.select_action(state, deterministic=False)
+            
+            # step environment
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # store transition to replay buffer
+            replay_buffer.push(state, action, reward, next_state, float(done))
+            
+            state = next_state
+            episode_reward += reward
+            episode_length += 1
+            global_step += 1
+            
+            # train agent
+            if len(replay_buffer) >= batch_size:
+                train_info = agent.train_step(replay_buffer, batch_size)
+                
+                # log training metrics
+                if train_info:
+                    for key, value in train_info.items():
+                        writer.add_scalar(key, value, global_step)
+            
+            if done:
+                break
+        
+        # episode stats
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+        current_episode_rewards.append(episode_reward)
+        current_episode_lengths.append(episode_length)
+        
+        # log per-episode stats
+        writer.add_scalar('train/episode_reward', episode_reward, episode)
+        writer.add_scalar('train/episode_length', episode_length, episode)
+        writer.add_scalar('train/buffer_size', len(replay_buffer), episode)
+        
+        # log batch stats (max/avg over recent episodes)
+        if len(current_episode_rewards) >= 10:
+            writer.add_scalar('train_batch/episode_batch_reward_mean', 
+                            np.mean(current_episode_rewards), episode)
+            writer.add_scalar('train_batch/episode_batch_reward_max', 
+                            np.max(current_episode_rewards), episode)
+            writer.add_scalar('train_batch/episode_batch_length_mean', 
+                            np.mean(current_episode_lengths), episode)
+            writer.add_scalar('train_batch/episode_batch_length_max', 
+                            np.max(current_episode_lengths), episode)
+            
+            # Reset batch tracking
+            current_episode_rewards = []
+            current_episode_lengths = []
+        
+        # VALIDATION
+        if (episode + 1) % eval_interval == 0:
+            eval_stats = evaluate_agent(agent, env_name, num_episodes=eval_episodes)
+            
+            # log eval metrics to tensorboard
+            for key, value in eval_stats.items():
+                writer.add_scalar(key, value, episode)
+            
+            # console prints too 
+            avg_reward = np.mean(episode_rewards[-10:])
+            print(f"Episode {episode + 1}/{max_episodes}")
+            print(f"\tTrain | avg reward (over last 10 episodes): {avg_reward:.2f}, last episode reward: {episode_reward:.2f}")
+            print(f"\tEval | avg reward: {eval_stats['eval/episode_reward_mean']:.2f}, "
+                  f"max reward: {eval_stats['eval/episode_reward_max']:.2f}")
+    
+    env.close()
+    writer.close()
+    
+    # Plot results
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(episode_rewards, alpha=0.6, label='Episode Reward')
+    # plt.plot(np.convolve(episode_rewards, np.ones(10)/10, mode='valid'), 
+            #  label='Moving Average (10)', linewidth=2)
+    plt.xlabel('Episode')
+    plt.ylabel('Reward')
+    plt.title('Training Rewards')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(episode_lengths, alpha=0.6, label='Episode Length')
+    # plt.plot(np.convolve(episode_lengths, np.ones(10)/10, mode='valid'), 
+    #          label='Moving Average (10)', linewidth=2)
+    plt.xlabel('Episode')
+    plt.ylabel('Steps')
+    plt.title('Episode Lengths')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_path = f'{log_dir}/training_plots.png'
+    plt.savefig(plot_path, dpi=150)
+    print(f"Training plot saved to '{plot_path}'")
+    
+    return agent, episode_rewards
+
+
+if __name__ == "__main__":
+    # Train the agent
+    print("=" * 60)
+    print("DSAC Training - Distributional Soft Actor-Critic")
+    print("=" * 60)
+    
+    env_name = "InvertedPendulum-v4"    
+    basepath = f'dsac/{env_name}/{datetime.now().strftime("%m_%d_%Y_%H%M%S")}'
+    savepath = f'{basepath}/agent.pth'
+    
+    # agent, rewards = train_dsac(
+    #     env_name=env_name,
+    #     max_episodes=300,
+    #     max_steps=500,
+    #     batch_size=256,
+    #     eval_interval=10,  # Evaluate every 10 episodes
+    #     eval_episodes=5,     # Run 5 episodes per evaluation
+    #     log_dir=basepath,
+    # )
+    
+    # torch.save(agent, savepath)
+    # print(f'Saved agent at {basepath}/agent.pth!')
+
+    savepath = 'dsac/InvertedPendulum-v4/11_12_2025_002404/agent.pth'
+    print(f'Loading agent from {savepath}')
+    agent = torch.load(
+        savepath, 
+        map_location='cuda' if torch.cuda.is_available() else 'cpu', 
+        weights_only=False
+    )
+    
+    # Final test
+    print("\n" + "=" * 60)
+    print("Final Evaluation (10 episodes)")
+    print("=" * 60)
+    
+    final_eval = evaluate_agent(agent, "InvertedPendulum-v4", num_episodes=10)
+    
+    print(f"Average Reward: {final_eval['eval/episode_reward_mean']:.2f} ± "
+          f"{final_eval['eval/episode_reward_std']:.2f}")
+    print(f"Max Reward: {final_eval['eval/episode_reward_max']:.2f}")
+    print(f"Average Episode Length: {final_eval['eval/episode_length_mean']:.1f}")
