@@ -17,17 +17,20 @@ from tqdm import tqdm
 # Paper: https://arxiv.org/pdf/2004.14547
 # Official implementation: https://github.com/xtma/dsac/tree/master
 #
-# This implementation has some parts simplified / ommitted for clarity.
-# Major differences include:
+# This implementation has some parts simplified / ommitted for clarity. Major differences include:
 # - No risk-sensitive policy updates
 # - No soft updates for the policy network (only for the 2 target Q-nets)
 # - Quantile network
 #       - IQN does not use cosine embeddings
 #       - Implemented fixed and IQN quantile generation, no FQF
-# - Replay buffer is simple FIFO with uniform sampling (SAC has all sorts of
-# replay buffer tricks to help stabilize training... engineering details?)
+# - Replay buffer is simple FIFO with uniform sampling (SAC has all sorts of replay buffer tricks to help 
+# stabilize training... engineering details?)
 #
 # Questions and potential bugs / confusion are marked with TODO comments.
+#
+#
+# Note about runtime: training for 300 episodes of 500 steps each takes ~15min locally on a laptop RTX 4070 gpu
+
 
 class ReplayBuffer:
     """Simple experience replay buffer. FIFO with uniform sampling."""
@@ -727,24 +730,24 @@ if __name__ == "__main__":
     print(f"Max Reward: {final_eval['eval/episode_reward_max']:.2f}")
     print(f"Average Episode Length: {final_eval['eval/episode_length_mean']:.1f}")
     
-    actions = final_eval['actions']
-    quantile_preds = final_eval['action_quantile_preds']
-    episode_rewards = np.expand_dims(final_eval['episode_rewards_after_each_step'], axis=-1)
+    actions = np.array(final_eval['actions'])
+    quantile_preds = np.array(final_eval['action_quantile_preds'])
+    episode_rewards = np.expand_dims(np.array(final_eval['episode_rewards_after_each_step']), axis=-1)
     print(f'Quantile Predictions: {quantile_preds.shape}')
     print(f'Actions Taken: {actions.shape}')
     print(f'Episode Rewards: {episode_rewards.shape}')
-    print(f'episode_rewards_after_each_step: {final_eval["episode_rewards_after_each_step"]}')
+    # print(f'episode_rewards_after_each_step: {final_eval["episode_rewards_after_each_step"]}')
     
     
     num_episodes = quantile_preds.shape[0]
 
     for ep in range(num_episodes):
         plt.figure(figsize=(12, 5))
-        plt.title(f"Episode {ep + 1}")
+        plt.title(f"Discounted rewards, predicted critic/Q-value quantiles over time for episode {ep + 1}")
         
         # Plot each of the 32 quantile lines (THESE ARE VALUES)
         for q in range(quantile_preds.shape[2]):
-            plt.plot(quantile_preds[ep][:, q], color='blue', alpha=0.2, linewidth=1)
+            plt.plot(quantile_preds[ep][:, q], color='blue', alpha=0.2, linewidth=1, label=f'Critic Quantile Pred {q}')
         
         # plot true episode reward
         # TODO this should not be the same as the quantile_preds, should instead plot reward-to-go for apples to 
@@ -766,14 +769,14 @@ if __name__ == "__main__":
             reward_to_go[t] = running_sum
         
         plt.plot(reward_to_go, 
-                 color='green', linestyle='--', linewidth=2, label='Episode Reward-To-Go (discounted)')
+                 color='green', linestyle='--', linewidth=2, label='Discounted Reward-To-Go')
         
         # Plot the actual action
-        plt.plot(actions[ep][:, 0], color='red', linewidth=2, label='Action Taken')
+        # plt.plot(actions[ep][:, 0], color='red', linewidth=2, label='Action Taken')
         
         plt.xlabel("Timestep")
         plt.ylabel("Value")
-        plt.legend()
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5),fontsize='xx-small') # Legend outside
         plt.tight_layout()
         plt.show()
 
