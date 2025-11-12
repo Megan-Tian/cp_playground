@@ -415,6 +415,7 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
             # action = agent.select_action(state, deterministic=True)
             if get_quantile_preds:
                 action, quantile_values = agent.select_action_with_quantiles(state, deterministic=True)
+                print(f'Quantile values: {quantile_values}')
                 action_quantiles.append(quantile_values)
             else:
                 action = agent.select_action(state, deterministic=True)
@@ -649,7 +650,7 @@ if __name__ == "__main__":
     
     final_eval = evaluate_agent(agent, "InvertedPendulum-v4", num_episodes=5, get_quantile_preds=True)
     
-    print(f"Average Reward: {final_eval['eval/episode_reward_mean']:.2f} ± "
+    print(f"Average Reward: {final_eval['eval/episode_reward_mean']:.2f} +/- "
           f"{final_eval['eval/episode_reward_std']:.2f}")
     print(f"Max Reward: {final_eval['eval/episode_reward_max']:.2f}")
     print(f"Average Episode Length: {final_eval['eval/episode_length_mean']:.1f}")
@@ -675,8 +676,27 @@ if __name__ == "__main__":
             plt.plot(quantile_preds[ep][:, q], color='blue', alpha=0.2, linewidth=1)
         
         # plot true episode reward
-        plt.plot(episode_rewards[ep], 
-                 color='green', linestyle='--', linewidth=2, label='Episode Reward')
+        # TODO this should not be the same as the quantile_preds, should instead plot reward-to-go for apples to 
+        # apples comparison i think
+        
+        
+        # Suppose rewards is your cumulative rewards array
+        rewards = np.array(episode_rewards[ep])
+
+        # recover individual rewards
+        r = np.empty_like(rewards)
+        r[0] = rewards[0]
+        r[1:] = rewards[1:] - rewards[:-1]
+
+        # compute discounted reward-to-go
+        reward_to_go = np.zeros_like(r, dtype=float)
+        running_sum = 0.0
+        for t in reversed(range(len(r))):
+            running_sum = r[t] + 0.99 * running_sum
+            reward_to_go[t] = running_sum
+        
+        plt.plot(reward_to_go, 
+                 color='green', linestyle='--', linewidth=2, label='Episode Reward-To-Go (discounted)')
         
         # Plot the actual action
         plt.plot(actions[ep][:, 0], color='red', linewidth=2, label='Action Taken')
