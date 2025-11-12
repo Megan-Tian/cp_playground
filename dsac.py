@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
+from tqdm import tqdm
+
 
 class ReplayBuffer:
     def __init__(self, capacity: int = 100000):
@@ -213,10 +215,10 @@ class DSAC:
     
     def get_tau(self, batch_size: int, mode: str = 'iqn'):
         """
-        Generate quantile fractions for distributional RL.
+        Generate `self.num_quantiles` quantile fractions for distributional RL.
         
         Args:
-            batch_size: number of samples/taus
+            batch_size: number of samples
             mode: 'fix' for evenly-spaced quantiles (0.1, 0.2, 0.3, ...)
                   'iqn' for random quantiles
         
@@ -368,30 +370,69 @@ class DSAC:
             action, _, _, _ = self.policy(state, deterministic=deterministic)
         return action.cpu().numpy()[0]
 
+    def select_action_with_quantiles(self, state, deterministic: bool = False):
+        """
+        Select action from policy along with `num_quantiles` unformly distributed quantile values.
+        
+        Returns:
+            action: (action_dimm,)
+            quantile_values: (num_quantiles,)
+            
+        Note that the number of quantiles returned is `self.num_quantiles`, which is set at agent initialization
+        and trained.
+        """
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
 
-def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10) -> Dict:
+        with torch.no_grad():
+            action, _, _, _ = self.policy(state, deterministic=deterministic)
+            tau, tau_hat, _ = self.get_tau(1, mode='fix')
+            quantile_values = torch.min(self.zf1(state, action, tau_hat), self.zf2(state, action, tau_hat))
+            
+        return action.cpu().numpy()[0], quantile_values.cpu().numpy()[0]
+    
+
+def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quantile_preds: bool = False, max_steps: int = 500) -> Dict:
     """
     Evaluate the agent on `num_episodes` validation episodes
     """
     env = gym.make(env_name)
-    episode_rewards = []
-    episode_lengths = []
+    episode_rewards = [] # (num_episodes,)
+    episode_lengths = [] # (num_episodes,)
+    episode_actions = [] # (num_episodes, episode_length, 1)
+    episode_quantile_values = [] # (num_episodes, episode_length, num_quantiles)
+    episode_rewards_after_each_step = [] # (num_episodes, episode_length)
     
-    for _ in range(num_episodes):
+    for _ in tqdm(range(num_episodes)):
         state, _ = env.reset()
         episode_reward = 0
         episode_length = 0
         done = False
+        actions = []
+        action_quantiles = []
+        reward_after_step = []
         
-        while not done:
-            action = agent.select_action(state, deterministic=True)
+        while not done and episode_length < max_steps:
+            # action = agent.select_action(state, deterministic=True)
+            if get_quantile_preds:
+                action, quantile_values = agent.select_action_with_quantiles(state, deterministic=True)
+                action_quantiles.append(quantile_values)
+            else:
+                action = agent.select_action(state, deterministic=True)
+                
             state, reward, terminated, truncated, _ = env.step(action)
             episode_reward += reward
             episode_length += 1
             done = terminated or truncated
+            
+            actions.append(action)
+            reward_after_step.append(episode_reward)
+            
         
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
+        episode_actions.append(actions)
+        episode_quantile_values.append(action_quantiles)
+        episode_rewards_after_each_step.append(reward_after_step)
     
     env.close()
     
@@ -402,6 +443,11 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10) -> Dict:
         'eval/episode_reward_std': np.std(episode_rewards),
         'eval/episode_length_mean': np.mean(episode_lengths),
         'eval/episode_length_max': np.max(episode_lengths),
+        
+        'actions': np.array(episode_actions),
+        'action_quantile_preds': np.array(episode_quantile_values) if get_quantile_preds else None,
+        'episode_rewards': np.array(episode_rewards),
+        'episode_rewards_after_each_step': np.array(episode_rewards_after_each_step)    
     }
 
 
@@ -454,7 +500,7 @@ def train_dsac(
     current_episode_lengths = []
     
     # TRAIN LOOP    
-    for episode in range(max_episodes):
+    for episode in tqdm(range(max_episodes)):
         state, _ = env.reset()
         episode_reward = 0
         episode_length = 0
@@ -601,9 +647,45 @@ if __name__ == "__main__":
     print("Final Evaluation (10 episodes)")
     print("=" * 60)
     
-    final_eval = evaluate_agent(agent, "InvertedPendulum-v4", num_episodes=10)
+    final_eval = evaluate_agent(agent, "InvertedPendulum-v4", num_episodes=5, get_quantile_preds=True)
     
     print(f"Average Reward: {final_eval['eval/episode_reward_mean']:.2f} ± "
           f"{final_eval['eval/episode_reward_std']:.2f}")
     print(f"Max Reward: {final_eval['eval/episode_reward_max']:.2f}")
     print(f"Average Episode Length: {final_eval['eval/episode_length_mean']:.1f}")
+    
+    actions = final_eval['actions']
+    quantile_preds = final_eval['action_quantile_preds']
+    episode_rewards = np.expand_dims(final_eval['episode_rewards_after_each_step'], axis=-1)
+    print(f'Quantile Predictions: {quantile_preds.shape}')
+    print(f'Actions Taken: {actions.shape}')
+    print(f'Episode Rewards: {episode_rewards.shape}')
+    print(f'episode_rewards_after_each_step: {final_eval["episode_rewards_after_each_step"]}')
+    
+    
+    num_episodes = quantile_preds.shape[0]
+
+    for ep in range(num_episodes):
+        plt.figure(figsize=(12, 5))
+        plt.title(f"Episode {ep + 1}")
+        
+        # Plot each of the 32 quantile lines (THESE ARE VALUES)
+        for q in range(quantile_preds.shape[2]):
+            # print(f'Plotting episode {ep}, quantile {q}, shape {quantile_preds[ep][:, q].shape}, avg value {np.mean(quantile_preds[ep][:, q]):.2f}')
+            plt.plot(quantile_preds[ep][:, q], color='blue', alpha=0.2, linewidth=1)
+        
+        # plot true episode reward
+        plt.plot(episode_rewards[ep], 
+                 color='green', linestyle='--', linewidth=2, label='Episode Reward')
+        
+        # Plot the actual action
+        plt.plot(actions[ep][:, 0], color='red', linewidth=2, label='Action Taken')
+        
+        plt.xlabel("Timestep")
+        plt.ylabel("Value")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    
+    print("Evaluation complete.")
