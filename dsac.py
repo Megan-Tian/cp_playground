@@ -140,8 +140,6 @@ class GaussianPolicy(nn.Module):
             action, log_prob (optional)
         """
         features = self.net(state)
-        # print(f"State is {state[:3]}")
-        # print(f"Features are {features[:3]}")
         
         # mean and log_std are two separate heads sharing backbone self.net
         mean = self.mean_layer(features)
@@ -154,7 +152,6 @@ class GaussianPolicy(nn.Module):
             action = torch.tanh(mean)
             log_prob = None
         else:
-            # print(f"Using stochastic policy sampling, mean is {mean[:3]}, log_std is {log_std[:3]}")
             dist = Normal(mean, std)
             # reparameterization trick
             x = dist.rsample()
@@ -168,7 +165,6 @@ class GaussianPolicy(nn.Module):
                 log_prob = dist.log_prob(x)
                 log_prob -= torch.log(self.action_scale * (1 - y.pow(2)) + 1e-6) # add small epsilon > 0 for numerical stability
                 log_prob = log_prob.sum(dim=-1, keepdim=True)
-                # print(f'log prob is {log_prob[:3]}, action after tanh and scaling is {action[:3]}')
                 mean = torch.tanh(mean) * self.action_scale + self.action_bias
             else:
                 log_prob = None
@@ -404,22 +400,28 @@ class DSAC:
         self.soft_update(self.zf1, self.target_zf1)
         self.soft_update(self.zf2, self.target_zf2)
         
-        return {
+        return { # log like all the loss components
             'loss/zf1_loss': zf1_loss.item(),
             'loss/zf2_loss': zf2_loss.item(),
             'loss/critic_loss': (zf1_loss.item() + zf2_loss.item()) / 2,
+            
             'loss/policy_loss': policy_loss.item(),
             'loss/policy_loss_entropy_term': entropy_term.item(),
             'loss/policy_loss_q_term': q_term.item(),
+            
             'loss/total_loss': zf1_loss.item() + zf2_loss.item() + policy_loss.item(),
+            
             'train/q_value_mean': q_new.mean().item(),
             'train/q_value_std': q_new.std().item(),
+            
             'train/q1_value': q1_new.mean().item(),
             'train/q2_value': q2_new.mean().item(),
             'train/log_prob_mean': log_probs.mean().item(),
             'train/log_prob_std': log_probs.std().item(),
+            
             'train/policy_mean': policy_mean.mean().item(),
             'train/policy_std': policy_log_std.exp().mean().item(),
+            
             'train/z1_pred_mean': z1_pred.mean().item(),
             'train/z2_pred_mean': z2_pred.mean().item(),
             'train/z_target_mean': z_target.mean().item(),
@@ -486,7 +488,6 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
             # action = agent.select_action(state, deterministic=True)
             if get_quantile_preds:
                 action, quantile_values = agent.select_action_with_quantiles(state, deterministic=True)
-                # print(f'Quantile values: {quantile_values}')
                 action_quantiles.append(quantile_values)
             else:
                 action = agent.select_action(state, deterministic=True)
@@ -660,9 +661,7 @@ def train_dsac(
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
-    plt.plot(episode_rewards, alpha=0.6, label='Episode Reward')
-    # plt.plot(np.convolve(episode_rewards, np.ones(10)/10, mode='valid'), 
-            #  label='Moving Average (10)', linewidth=2)
+    plt.plot(episode_rewards, label='Episode Reward')
     plt.xlabel('Episode')
     plt.ylabel('Reward')
     plt.title('Training Rewards')
@@ -670,9 +669,7 @@ def train_dsac(
     plt.grid(True, alpha=0.3)
     
     plt.subplot(1, 2, 2)
-    plt.plot(episode_lengths, alpha=0.6, label='Episode Length')
-    # plt.plot(np.convolve(episode_lengths, np.ones(10)/10, mode='valid'), 
-    #          label='Moving Average (10)', linewidth=2)
+    plt.plot(episode_lengths, label='Episode Length')
     plt.xlabel('Episode')
     plt.ylabel('Steps')
     plt.title('Episode Lengths')
@@ -747,7 +744,6 @@ if __name__ == "__main__":
         
         # Plot each of the 32 quantile lines (THESE ARE VALUES)
         for q in range(quantile_preds.shape[2]):
-            # print(f'Plotting episode {ep}, quantile {q}, shape {quantile_preds[ep][:, q].shape}, avg value {np.mean(quantile_preds[ep][:, q]):.2f}')
             plt.plot(quantile_preds[ep][:, q], color='blue', alpha=0.2, linewidth=1)
         
         # plot true episode reward
