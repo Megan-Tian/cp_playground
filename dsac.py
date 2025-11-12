@@ -13,12 +13,30 @@ from datetime import datetime
 
 from tqdm import tqdm
 
+# An attempt at implementing Distributional Soft Actor-Critic (DSAC)
+# Paper: https://arxiv.org/pdf/2004.14547
+# Official implementation: https://github.com/xtma/dsac/tree/master
+#
+# This implementation has some parts simplified / ommitted for clarity.
+# Major differences include:
+# - No risk-sensitive policy updates
+# - No soft updates for the policy network (only for the 2 target Q-nets)
+# - Quantile network
+#       - IQN does not use cosine embeddings
+#       - Implemented fixed and IQN quantile generation, no FQF
+# - Replay buffer is simple FIFO with uniform sampling (SAC has all sorts of
+# replay buffer tricks to help stabilize training... engineering details?)
+#
+# Questions and potential bugs / confusion are marked with TODO comments.
 
 class ReplayBuffer:
-    def __init__(self, capacity: int = 100000):
+    """Simple experience replay buffer. FIFO with uniform sampling."""
+    def __init__(self, capacity: int = 100_000):
+        # oldest experiences automatically removed when capacity exceeded
+        self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
     
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, done):        
         self.buffer.append((state, action, reward, next_state, done))
     
     def sample(self, batch_size: int):
@@ -38,7 +56,11 @@ class ReplayBuffer:
 
 
 class QuantileNetwork(nn.Module):
-    """Quantile value network Z(s, a, tau)"""
+    """
+    Quantile value network Z(s, a, tau)
+    
+    Note this is not the same as reference implementation which uses IQN with cosine embeddings (appendix B eq 18)
+    """
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, 
                  num_quantiles: int = 32):
         super().__init__()
@@ -61,6 +83,7 @@ class QuantileNetwork(nn.Module):
             state: (batch_size, state_dim)
             action: (batch_size, action_dim)
             tau: (batch_size, num_quantiles)
+            
         Returns:
             quantile_values: (batch_size, num_quantiles)
         """
@@ -68,19 +91,19 @@ class QuantileNetwork(nn.Module):
         num_quantiles = tau.shape[1]
         
         # expand state and action to match quantiles
-        state_expanded = state.unsqueeze(1).expand(-1, num_quantiles, -1)  # (B, T, state_dim)
-        action_expanded = action.unsqueeze(1).expand(-1, num_quantiles, -1)  # (B, T, action_dim)
-        tau_expanded = tau.unsqueeze(-1)  # (B, T, 1)
+        state_expanded = state.unsqueeze(1).expand(-1, num_quantiles, -1)  # (B, num_quantiles, state_dim)
+        action_expanded = action.unsqueeze(1).expand(-1, num_quantiles, -1)  # (B, num_quantiles, action_dim)
+        tau_expanded = tau.unsqueeze(-1)  # (B, num_quantiles, 1)
         
         # concatenate all inputs to match input shape to self.net
-        inputs = torch.cat([state_expanded, action_expanded, tau_expanded], dim=-1)  # (B, T, state_dim + action_dim + 1)
-        inputs_flat = inputs.reshape(-1, inputs.shape[-1])  # (B*T, state_dim + action_dim + 1)
+        inputs = torch.cat([state_expanded, action_expanded, tau_expanded], dim=-1)  # (B, num_quantiles, state_dim + action_dim + 1)
+        inputs_flat = inputs.reshape(-1, inputs.shape[-1])  # (B * num_quantiles, state_dim + action_dim + 1)
         
         # send through network
-        outputs_flat = self.net(inputs_flat)  # (B*T, 1)
+        outputs_flat = self.net(inputs_flat)  # (B * num_quantiles, 1)
         
         # reshape back
-        quantile_values = outputs_flat.reshape(batch_size, num_quantiles)  # (B, T)
+        quantile_values = outputs_flat.reshape(batch_size, num_quantiles)  # (B, num_quantiles)
         
         return quantile_values
 
@@ -93,6 +116,11 @@ class GaussianPolicy(nn.Module):
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
         
+        # FOR TANH ACTION SQUASHING / SCALING 
+        self.action_scale = 3.0 # FOR INVERTED PENDULUM ACTIONS ARE IN [-3, 3]
+        self.action_bias = 0.0
+        
+        
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -100,7 +128,7 @@ class GaussianPolicy(nn.Module):
             nn.ReLU()
         )
         
-        # mean and std of actions are implementated as separate output heads/layers on top of self.net
+        # mean and std of the Gaussian the actions are implementated as separate output heads/layers on top of self.net
         self.mean_layer = nn.Linear(hidden_dim, action_dim)
         self.log_std_layer = nn.Linear(hidden_dim, action_dim)
     
@@ -112,29 +140,36 @@ class GaussianPolicy(nn.Module):
             action, log_prob (optional)
         """
         features = self.net(state)
+        # print(f"State is {state[:3]}")
+        # print(f"Features are {features[:3]}")
         
-        # mean and std are two separate heads sharing backbone self.net
+        # mean and log_std are two separate heads sharing backbone self.net
         mean = self.mean_layer(features)
         log_std = self.log_std_layer(features)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        # TODO to clamp or not to clamp? clamped in paper impl: https://github.com/xtma/dsac/blob/master/rlkit/torch/dsac/policies.py
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max) 
         std = log_std.exp()
         
         if deterministic:
             action = torch.tanh(mean)
             log_prob = None
         else:
+            # print(f"Using stochastic policy sampling, mean is {mean[:3]}, log_std is {log_std[:3]}")
             dist = Normal(mean, std)
             # reparameterization trick
             x = dist.rsample()
-            action = torch.tanh(x)
+            y = torch.tanh(x)
+            action = y * self.action_scale + self.action_bias
             
             if return_log_prob:
                 # compute log probability with tanh correction
-                # see appendix C of SAC paper
+                # see appendix C of SAC paper (?)
                 # also: https://dosssman.github.io/posts/2022-04-13-sac/#policy-network-1
                 log_prob = dist.log_prob(x)
-                log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+                log_prob -= torch.log(self.action_scale * (1 - y.pow(2)) + 1e-6) # add small epsilon > 0 for numerical stability
                 log_prob = log_prob.sum(dim=-1, keepdim=True)
+                # print(f'log prob is {log_prob[:3]}, action after tanh and scaling is {action[:3]}')
+                mean = torch.tanh(mean) * self.action_scale + self.action_bias
             else:
                 log_prob = None
         
@@ -156,21 +191,45 @@ def quantile_huber_loss(quantile_pred, target, tau, kappa: float = 1.0):
     target = target.unsqueeze(1)  # (B, 1, T)
     tau = tau.unsqueeze(-1)  # (B, T, 1)
     
-    # pairwise td errors
-    td_errors = target - quantile_pred  # (B, T, T)
+    errors = target - quantile_pred  # (B, T, T)
     
     # huber loss
     huber_loss = torch.where(
-        td_errors.abs() <= kappa,
-        0.5 * td_errors.pow(2),
-        kappa * (td_errors.abs() - 0.5 * kappa)
+        errors.abs() <= kappa,
+        0.5 * errors.pow(2),
+        kappa * (errors.abs() - 0.5 * kappa)
     )
     
     # qr loss, (tau - td_errors < 0) does the weighting / decides what threshold to use
-    quantile_weight = torch.abs(tau - (td_errors < 0).float())
+    quantile_weight = torch.abs(tau - (errors < 0).float())
     loss = (quantile_weight * huber_loss).mean()
     
     return loss
+
+
+
+def quantile_regression_loss(input, target, tau, weight):
+    """
+    input: (N, T)
+    target: (N, T)
+    tau: (N, T)
+    weight: (N, T)
+    
+    ngl this is straight up from the ref code. wrapping my head around
+    how/why this is different from `quantile_huber_loss()` above...
+    
+    https://github.com/xtma/dsac/blob/master/rlkit/torch/td4/td4.py#L78
+    """
+    input = input.unsqueeze(-1)
+    target = target.detach().unsqueeze(-2)
+    tau = tau.detach().unsqueeze(-1)
+    weight = weight.detach().unsqueeze(-2)
+    expanded_input, expanded_target = torch.broadcast_tensors(input, target)
+    L = F.smooth_l1_loss(expanded_input, expanded_target, reduction="none")  # (N, T, T)
+    sign = torch.sign(expanded_input - expanded_target) / 2. + 0.5
+    rho = torch.abs(tau - sign) * L * weight
+    return rho.sum(dim=-1).mean()
+
 
 
 class DSAC:
@@ -273,18 +332,20 @@ class DSAC:
             # sample next actions from current policy
             next_actions, next_log_probs, _, _ = self.policy(next_states)
             
-            # get quantile fractions
+            # get quantile fractions 
+            # reference impl shares the same taus between Q-nets: https://github.com/xtma/dsac/blob/master/rlkit/torch/dsac/dsac.py#L181
+            # have a set of taus for target networks and a DIFFERENT set for the critic Q nets
             next_tau, next_tau_hat, next_presum_tau = self.get_tau(batch_size)
             
             # compute target quantile values (remember to do both q nets)
             target_z1 = self.target_zf1(next_states, next_actions, next_tau_hat)
             target_z2 = self.target_zf2(next_states, next_actions, next_tau_hat)
-            target_z = torch.min(target_z1, target_z2)
+            target_z = torch.min(target_z1, target_z2) # in algorithm 1 this is y_i in the nested for loop (min value estimate across all quantiles)
             
             # entropy bonus (sac)
             target_z = target_z - self.alpha * next_log_probs
             
-            # distributional Bellman target
+            # delta^k_{ij} in algorithm 1. exclude done states in discount because those have no future rewards
             z_target = rewards + (1 - dones) * self.discount * target_z
         
         # current quantile values
@@ -292,9 +353,13 @@ class DSAC:
         z1_pred = self.zf1(states, actions, tau_hat)
         z2_pred = self.zf2(states, actions, tau_hat)
         
-        # quantile regression losses
-        zf1_loss = quantile_huber_loss(z1_pred, z_target, tau_hat)
-        zf2_loss = quantile_huber_loss(z2_pred, z_target, tau_hat)
+        # quantile regression losses 
+        # zf1_loss = quantile_huber_loss(z1_pred, z_target, tau_hat)
+        # zf2_loss = quantile_huber_loss(z2_pred, z_target, tau_hat)
+        
+        # TODO: weight by presum_tau in ref impl - why? 
+        zf1_loss = quantile_regression_loss(z1_pred, z_target, tau_hat, presum_tau)
+        zf2_loss = quantile_regression_loss(z2_pred, z_target, tau_hat, presum_tau)
         
         # update Q networks
         self.zf1_optimizer.zero_grad()
@@ -306,14 +371,18 @@ class DSAC:
         self.zf2_optimizer.step()
         
         # UPDATE POLICY
+        # new actions with reparameterized/updated samples
         new_actions, log_probs, policy_mean, policy_log_std = self.policy(states)
         
         # get q vals from quantile networks
+        # TODO it is unclear to me why we get_tau() 3 times in train_step though it shows up in the ref impl
+        # TODO did i do this wrong the algorithm box "says generate quantile fractions" at the top and that's it...
         new_tau, new_tau_hat, new_presum_tau = self.get_tau(batch_size)
         z1_new = self.zf1(states, new_actions, new_tau_hat)
         z2_new = self.zf2(states, new_actions, new_tau_hat)
         
         # compute expected Q values (expectation over quantiles)
+        # this is for a "neutral" (aka no) risk measure - ref code and paper have more stuff wrt the policy update
         q1_new = (new_presum_tau * z1_new).sum(dim=1, keepdim=True)
         q2_new = (new_presum_tau * z2_new).sum(dim=1, keepdim=True)
         q_new = torch.min(q1_new, q2_new)
@@ -330,6 +399,8 @@ class DSAC:
         self.policy_optimizer.step()
         
         # UPDATE TARGET NETWORKS (SOFT UPDATE)
+        # TODO: maybe don't update every step? 
+        # upon further examination the ref code also does soft update on the policy network (not every step)
         self.soft_update(self.zf1, self.target_zf1)
         self.soft_update(self.zf2, self.target_zf2)
         
@@ -338,8 +409,8 @@ class DSAC:
             'loss/zf2_loss': zf2_loss.item(),
             'loss/critic_loss': (zf1_loss.item() + zf2_loss.item()) / 2,
             'loss/policy_loss': policy_loss.item(),
-            'loss/entropy_term': entropy_term.item(),
-            'loss/q_term': q_term.item(),
+            'loss/policy_loss_entropy_term': entropy_term.item(),
+            'loss/policy_loss_q_term': q_term.item(),
             'loss/total_loss': zf1_loss.item() + zf2_loss.item() + policy_loss.item(),
             'train/q_value_mean': q_new.mean().item(),
             'train/q_value_std': q_new.std().item(),
@@ -391,11 +462,11 @@ class DSAC:
         return action.cpu().numpy()[0], quantile_values.cpu().numpy()[0]
     
 
-def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quantile_preds: bool = False, max_steps: int = 500) -> Dict:
+def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quantile_preds: bool = False, max_steps_per_episode: int = 500) -> Dict:
     """
     Evaluate the agent on `num_episodes` validation episodes
     """
-    env = gym.make(env_name)
+    env = gym.make(env_name) # make fresh env
     episode_rewards = [] # (num_episodes,)
     episode_lengths = [] # (num_episodes,)
     episode_actions = [] # (num_episodes, episode_length, 1)
@@ -411,11 +482,11 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
         action_quantiles = []
         reward_after_step = []
         
-        while not done and episode_length < max_steps:
+        while not done and episode_length < max_steps_per_episode:
             # action = agent.select_action(state, deterministic=True)
             if get_quantile_preds:
                 action, quantile_values = agent.select_action_with_quantiles(state, deterministic=True)
-                print(f'Quantile values: {quantile_values}')
+                # print(f'Quantile values: {quantile_values}')
                 action_quantiles.append(quantile_values)
             else:
                 action = agent.select_action(state, deterministic=True)
@@ -438,6 +509,7 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
     env.close()
     
     return {
+        # log these to tensorboard (scalars)
         'eval/episode_reward_mean': np.mean(episode_rewards),
         'eval/episode_reward_max': np.max(episode_rewards),
         'eval/episode_reward_min': np.min(episode_rewards),
@@ -445,10 +517,11 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
         'eval/episode_length_mean': np.mean(episode_lengths),
         'eval/episode_length_max': np.max(episode_lengths),
         
-        'actions': np.array(episode_actions),
-        'action_quantile_preds': np.array(episode_quantile_values) if get_quantile_preds else None,
-        'episode_rewards': np.array(episode_rewards),
-        'episode_rewards_after_each_step': np.array(episode_rewards_after_each_step)    
+        # use these for plotting along steps in a single episode
+        'actions': episode_actions,
+        'action_quantile_preds': episode_quantile_values if get_quantile_preds else None,
+        'episode_rewards': episode_rewards, # total rewards per episode
+        'episode_rewards_after_each_step': episode_rewards_after_each_step  # total rewards accumulated up to each step in the episode
     }
 
 
@@ -456,6 +529,7 @@ def train_dsac(
     env_name: str = "InvertedPendulum-v4",
     max_episodes: int = 300,
     max_steps: int = 1000,
+    init_random_frames: int = 1000,
     batch_size: int = 256,
     eval_interval: int = 10,
     eval_episodes: int = 5,
@@ -487,7 +561,7 @@ def train_dsac(
         num_quantiles=32,
         discount=0.99,
         alpha=0.2,
-        device=device
+        device=device,
     )
     
     # replay buffer
@@ -507,11 +581,11 @@ def train_dsac(
         episode_length = 0
         
         for step in range(max_steps):
-            # select action
-            if len(replay_buffer) < 1000:
+            # select action (to add experiences to replay buffer)
+            if len(replay_buffer) < init_random_frames: # initial random exploration - TODO make this a param
                 action = env.action_space.sample()
             else:
-                action = agent.select_action(state, deterministic=False)
+                action = agent.select_action(state, deterministic=False) # TODO should this be deterministic=True during training?
             
             # step environment
             next_state, reward, terminated, truncated, _ = env.step(action)
@@ -569,7 +643,8 @@ def train_dsac(
             
             # log eval metrics to tensorboard
             for key, value in eval_stats.items():
-                writer.add_scalar(key, value, episode)
+                if key.startswith('eval/'):
+                    writer.add_scalar(key, value, episode)
             
             # console prints too 
             avg_reward = np.mean(episode_rewards[-10:])
@@ -622,20 +697,20 @@ if __name__ == "__main__":
     basepath = f'dsac/{env_name}/{datetime.now().strftime("%m_%d_%Y_%H%M%S")}'
     savepath = f'{basepath}/agent.pth'
     
-    # agent, rewards = train_dsac(
-    #     env_name=env_name,
-    #     max_episodes=300,
-    #     max_steps=500,
-    #     batch_size=256,
-    #     eval_interval=10,  # Evaluate every 10 episodes
-    #     eval_episodes=5,     # Run 5 episodes per evaluation
-    #     log_dir=basepath,
-    # )
+    agent, rewards = train_dsac(
+        env_name=env_name,
+        max_episodes=300,
+        max_steps=500,
+        batch_size=256,
+        eval_interval=10,  # Evaluate every 10 episodes
+        eval_episodes=5,     # Run 5 episodes per evaluation
+        log_dir=basepath,
+    )
     
-    # torch.save(agent, savepath)
-    # print(f'Saved agent at {basepath}/agent.pth!')
+    torch.save(agent, savepath)
+    print(f'Saved agent at {basepath}/agent.pth!')
 
-    savepath = 'dsac/InvertedPendulum-v4/11_12_2025_002404/agent.pth'
+    # savepath = 'dsac/InvertedPendulum-v4/11_12_2025_002404/agent.pth'
     print(f'Loading agent from {savepath}')
     agent = torch.load(
         savepath, 
@@ -678,7 +753,6 @@ if __name__ == "__main__":
         # plot true episode reward
         # TODO this should not be the same as the quantile_preds, should instead plot reward-to-go for apples to 
         # apples comparison i think
-        
         
         # Suppose rewards is your cumulative rewards array
         rewards = np.array(episode_rewards[ep])
