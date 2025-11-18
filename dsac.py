@@ -469,12 +469,13 @@ class DSAC:
 
 def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quantile_preds: bool = False, max_steps_per_episode: int = 500) -> Dict:
     """
-    Evaluate the agent on `num_episodes` validation episodes
+    Evaluate the agent on `num_episodes` validation episodes with fixed quantiles.
     """
     env = gym.make(env_name) # make fresh env
     episode_rewards = [] # (num_episodes,)
     episode_lengths = [] # (num_episodes,)
     episode_actions = [] # (num_episodes, episode_length, 1)
+    episode_states = [] # (num_episodes, episode_length, state_dim)
     episode_quantile_values = [] # (num_episodes, episode_length, num_quantiles)
     episode_rewards_after_each_step = [] # (num_episodes, episode_length)
     
@@ -484,6 +485,7 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
         episode_length = 0
         done = False
         actions = []
+        states = []
         action_quantiles = []
         reward_after_step = []
         
@@ -501,12 +503,14 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
             done = terminated or truncated
             
             actions.append(action)
+            states.append(state)
             reward_after_step.append(episode_reward)
             
         
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
         episode_actions.append(actions)
+        episode_states.append(states)
         episode_quantile_values.append(action_quantiles)
         episode_rewards_after_each_step.append(reward_after_step)
     
@@ -523,6 +527,7 @@ def evaluate_agent(agent: DSAC, env_name: str, num_episodes: int = 10, get_quant
         
         # use these for plotting along steps in a single episode
         'actions': episode_actions,
+        'states': episode_states,
         'action_quantile_preds': episode_quantile_values if get_quantile_preds else None,
         'episode_rewards': episode_rewards, # total rewards per episode
         'episode_rewards_after_each_step': episode_rewards_after_each_step  # total rewards accumulated up to each step in the episode
@@ -697,20 +702,23 @@ if __name__ == "__main__":
     basepath = f'dsac/{env_name}/{datetime.now().strftime("%m_%d_%Y_%H%M%S")}'
     savepath = f'{basepath}/agent.pth'
     
-    agent, rewards = train_dsac(
-        env_name=env_name,
-        max_episodes=300,
-        max_steps=500,
-        batch_size=256,
-        eval_interval=10,  # Evaluate every 10 episodes
-        eval_episodes=5,     # Run 5 episodes per evaluation
-        log_dir=basepath,
-    )
+    ################### TRAIN ###################
+    # agent, rewards = train_dsac(
+    #     env_name=env_name,
+    #     max_episodes=300,
+    #     max_steps=500,
+    #     batch_size=256,
+    #     eval_interval=10,  # Evaluate every 10 episodes
+    #     eval_episodes=5,     # Run 5 episodes per evaluation
+    #     log_dir=basepath,
+    # )
     
-    torch.save(agent, savepath)
-    print(f'Saved agent at {basepath}/agent.pth!')
-
-    # savepath = 'dsac/InvertedPendulum-v4/11_12_2025_002404/agent.pth'
+    # torch.save(agent, savepath)
+    # print(f'Saved agent at {basepath}/agent.pth!')
+    ##############################################
+    
+    savepath = 'dsac/InvertedPendulum-v4/11_12_2025_002404/agent.pth'
+    # savepath = 'dsac/InvertedPendulum-v4/11_12_2025_182447/agent.pth'
     print(f'Loading agent from {savepath}')
     agent = torch.load(
         savepath, 
@@ -723,7 +731,7 @@ if __name__ == "__main__":
     print("Final Evaluation (10 episodes)")
     print("=" * 60)
     
-    final_eval = evaluate_agent(agent, "InvertedPendulum-v4", num_episodes=5, get_quantile_preds=True)
+    final_eval = evaluate_agent(agent, "InvertedPendulum-v4", num_episodes=2, get_quantile_preds=True)
     
     print(f"Average Reward: {final_eval['eval/episode_reward_mean']:.2f} +/- "
           f"{final_eval['eval/episode_reward_std']:.2f}")
@@ -731,6 +739,7 @@ if __name__ == "__main__":
     print(f"Average Episode Length: {final_eval['eval/episode_length_mean']:.1f}")
     
     actions = np.array(final_eval['actions'])
+    states = np.array(final_eval['states'])
     quantile_preds = np.array(final_eval['action_quantile_preds'])
     episode_rewards = np.expand_dims(np.array(final_eval['episode_rewards_after_each_step']), axis=-1)
     print(f'Quantile Predictions: {quantile_preds.shape}')
@@ -741,13 +750,14 @@ if __name__ == "__main__":
     
     num_episodes = quantile_preds.shape[0]
 
+    # plot the quantile predictions and true discounted rewards over time for each episode
     for ep in range(num_episodes):
         plt.figure(figsize=(12, 5))
         plt.title(f"Discounted rewards, predicted critic/Q-value quantiles over time for episode {ep + 1}")
         
         # Plot each of the 32 quantile lines (THESE ARE VALUES)
         for q in range(quantile_preds.shape[2]):
-            plt.plot(quantile_preds[ep][:, q], color='blue', alpha=0.2, linewidth=1, label=f'Critic Quantile Pred {q}')
+            plt.plot(quantile_preds[ep][:, q], alpha=0.2, linewidth=1, label=f'Critic Quantile Pred {q}')
         
         # plot true episode reward
         # TODO this should not be the same as the quantile_preds, should instead plot reward-to-go for apples to 
@@ -768,8 +778,8 @@ if __name__ == "__main__":
             running_sum = r[t] + 0.99 * running_sum
             reward_to_go[t] = running_sum
         
-        plt.plot(reward_to_go, 
-                 color='green', linestyle='--', linewidth=2, label='Discounted Reward-To-Go')
+        # plt.plot(reward_to_go, 
+        #          color='green', linestyle='--', linewidth=2, label='Discounted Reward-To-Go')
         
         # Plot the actual action
         # plt.plot(actions[ep][:, 0], color='red', linewidth=2, label='Action Taken')
@@ -779,6 +789,57 @@ if __name__ == "__main__":
         plt.legend(loc='center left', bbox_to_anchor=(1, 0.5),fontsize='xx-small') # Legend outside
         plt.tight_layout()
         plt.show()
+        
+    # plot the predicted quantiles averaged over all (s, a) in each eval episode
+    num_ep = quantile_preds.shape[0]
+    ep_len = quantile_preds.shape[1]
+    num_quantiles = quantile_preds.shape[2]
+    for ep in range(num_ep):
+        # get Q-values for this episode (shape: ep_len, num_quantiles)
+        q_values = quantile_preds[ep]
+        q_values_by_quantile_avg_over_ep = np.mean(q_values, axis=0)
+        cumulative_prob = np.linspace(0, 1, len(q_values_by_quantile_avg_over_ep))
 
+        # Plot the CDF
+        plt.figure(figsize=(8, 6))
+        plt.step(q_values_by_quantile_avg_over_ep, cumulative_prob, where="post", label=f'Episode {ep + 1}')
+
+        # add vertical lines for some quantiles
+        quantiles = [0.25, 0.5, 0.75]
+        for q in quantiles:
+            q_value = np.percentile(q_values_by_quantile_avg_over_ep, q * 100)
+            plt.axvline(q_value, color='gray', alpha=q, linestyle='--', label=f'{int(q * 100)}% Quantile')
+
+        plt.title(f'Episode {ep} - Q-values by quantile (averaged over all (s,a))')
+        plt.xlabel('Q-value')
+        plt.ylabel('Cumulative Probability (quantile tau)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    
+    # plot predicted quantiles for specific timesteps in an episode
+    timesteps = [0, ep_len // 4, ep_len // 2, (3 * ep_len) // 4, ep_len - 1]
+    for ep in range(num_ep):
+        for t in timesteps:
+            # get Q-values for this episode and timestep (shape: num_quantiles)
+            q_values = quantile_preds[ep][t]
+            cumulative_prob = np.linspace(0, 1, len(q_values))
+
+            # Plot the CDF
+            plt.figure(figsize=(8, 6))
+            plt.step(q_values, cumulative_prob, where="post", label=f'Episode {ep + 1}')
+
+            # add vertical lines for some quantiles
+            quantiles = [0.25, 0.5, 0.75]
+            for q in quantiles:
+                q_value = np.percentile(q_values, q * 100)
+                plt.axvline(q_value, color='gray', alpha=q, linestyle='--', label=f'{int(q * 100)}% Quantile')
+
+            plt.title(f'Episode {ep} - Q-values by quantile\nTimestep {t}/{ep_len}\nstate: {states[ep][t]}\naction: {actions[ep][t]}')
+            plt.xlabel('Q-value')
+            plt.ylabel('Cumulative Probability (quantile tau)')
+            plt.legend()
+            plt.grid(True)
+            plt.show()
     
     print("Evaluation complete.")
