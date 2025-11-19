@@ -703,22 +703,23 @@ if __name__ == "__main__":
     savepath = f'{basepath}/agent.pth'
     
     ################### TRAIN ###################
-    agent, rewards = train_dsac(
-        env_name=env_name,
-        max_episodes=1000, # default: 300 (this was literally just the first number i chose/guessed)
-        max_steps=1000, # default: 1000 (this was literally just the first number i chose/guessed)
-        batch_size=256,
-        eval_interval=10,  # Evaluate every 10 episodes
-        eval_episodes=5,     # Run 5 episodes per evaluation
-        log_dir=basepath,
-    )
+    # agent, rewards = train_dsac(
+    #     env_name=env_name,
+    #     max_episodes=1, # default: 300 (this was literally just the first number i chose/guessed)
+    #     max_steps=1000, # default: 1000 (this was literally just the first number i chose/guessed)
+    #     batch_size=256,
+    #     eval_interval=10,  # Evaluate every 10 episodes
+    #     eval_episodes=5,     # Run 5 episodes per evaluation
+    #     log_dir=basepath,
+    # )
     
-    torch.save(agent, savepath)
-    print(f'Saved agent at {savepath}/agent.pth!')
+    # torch.save(agent, savepath)
+    # print(f'Saved agent at {savepath}/agent.pth!')
     ##############################################
     
-    # savepath = 'dsac/InvertedPendulum-v4/11_12_2025_002404/agent.pth'
-    # # savepath = 'dsac/InvertedPendulum-v4/11_12_2025_182447/agent.pth'
+    # savepath = 'dsac/InvertedPendulum-v4/11_12_2025_002404/agent.pth' # pre-loss change
+    # # savepath = 'dsac/InvertedPendulum-v4/11_12_2025_182447/agent.pth' # post-loss change
+    savepath = 'dsac/InvertedPendulum-v4/11_19_2025_111823_test_post_gitlfs/agent.pth'
     print(f'Loading agent from {savepath}')
     agent = torch.load(
         savepath, 
